@@ -1,0 +1,356 @@
+
+
+#import controller.robot_6dof_newDH_fixing as r
+from types import SimpleNamespace
+import math
+from scipy.spatial.transform import Rotation
+
+
+import mujoco
+import mujoco.viewer as viewer
+import numpy as np
+import time
+
+args = SimpleNamespace(
+    motor_ids = [1, 2, 3, 4, 5, 6],  # IDs of the motors you want to control
+    goal_velocities = [0, 0, 0, 0, 0, 0],  # Velocities in Dynamixel units (adjust according to your motor's range)
+    motor_offsets = [0, 1024, 2048, 3072, 2048, 2048],
+    ADDR_PRO_GOAL_VELOCITY = 104, # This can vary depending on the Dynamixel model
+    ADDR_PRESENT_POSITION = 132,
+    ADDR_TORQUE_ENABLE = 64,
+    ADDR_OPERATING_MODE = 11,        # Typically the address for the Operating Mode
+    ADDR_GOAL_POSITION = 116,
+    LEN_PRO_GOAL_VELOCITY = 4,     # Length of the goal velocity value (4 bytes for a 32-bit value)
+    LEN_PRO_PRESENT_POSITION = 4,
+    PROTOCOL_VERSION = 2.0,
+    POSITION_CONTROL_MODE = 3,
+    VELOCITY_CONTROL_MODE = 1,
+    BAUDRATE = 57600,#1000000,  # Adjust based on your Dynamixel motor configuration
+    DEVICENAME = '/dev/tty.usbserial-FT7928RB',#'/dev/tty.usbserial-FT7W92VO',#'/dev/tty.usbserial-FT7W93U3',  # Replace with the actual port
+    hw_interface = 'defualt',
+    velocity_controller = 'default',
+    q_init = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+    links = np.array([20.0, 20.0, 20.0, 5.0, 3.5, 5.0]),
+    motor_steps = 4096,
+    velocity_limit = 50,#1023,
+    motorStep_to_radians = 0.0
+    )
+args.motorStep_to_radians = 2 * math.pi / args.motor_steps
+
+
+
+
+# Function to compute task-space inertia matrix (Lambda)
+def compute_task_space_inertia(H, J):
+    return np.linalg.inv(J @ np.linalg.inv(H) @ J.T)
+
+
+# Impedance control function
+def impedance_control(dx, dx_des, M_d, K_p, K_d, dt=1):#(x, x_des, dx, dx_des, M_d, K_p, K_d, dt=1e-3):
+    # print("-----> ", dx)
+    # print("M_d: ", M_d.shape)
+    # print("K_p: ", K_p.shape)
+    # print("x: ", x.shape)
+    # print("(dx_des - dx): ", (dx_des - dx).shape)
+    # print("(K_p * (x_des - x)/dt - K_d * dx): ", (K_p * (x_des - x)/dt - K_d * dx).shape)
+    # print("(K_p @ (x_des - x)/dt - K_d @ dx) val: ", (K_p @ (x_des - x)/dt - K_d @ dx))
+    
+
+    #return M_d @ (K_p * (x_des - x)/dt - K_d * dx)
+    return M_d @ (K_p * dx_des/dt - K_d * dx)
+
+
+
+def has_bad_values(arr, threshold=1e3):
+    if np.any(np.isnan(arr)) or np.any(np.isinf(arr)) or np.any(np.abs(arr) > threshold):
+        print(arr)
+        print("********************")
+    return np.any(np.isnan(arr)) or np.any(np.isinf(arr)) or np.any(np.abs(arr) > threshold)
+
+
+
+def get_current_ee_pos(model, data, end_effector_id):
+    pos = data.site_xpos[end_effector_id]
+    
+    # Convert 3×3 rotation matrix to Euler angles
+    rot_matrix = data.site_xmat[end_effector_id].reshape(3, 3)
+    euler_xyz = Rotation.from_matrix(rot_matrix).as_euler('xyz', degrees=False)  # Change 'xyz' to preferred order
+
+    #return pos, euler_xyz  # Return both position and Euler angles
+    return np.concatenate([pos, euler_xyz])
+
+def numerical_jacobian(model, data, end_effector_id, delta=1e-8):
+    nq = model.nv  # Number of velocity DoFs
+    J_num = np.zeros((6, nq))  # Full spatial Jacobian
+
+    # Save original qvel
+    qpos_original = np.copy(data.qpos)
+    xpos_original = np.copy(get_current_ee_pos(model, data, end_effector_id))
+    
+    #cvel_original = np.copy(data.cvel)
+    for i in range(nq):
+        # Perturb joint velocity i
+        data.qpos[i] += delta
+        mujoco.mj_forward(model, data)  # Update FK
+
+        # Compute new velocity of end-effector
+        dx_new = get_current_ee_pos(model, data, end_effector_id)# np.copy(data.cvel[end_effector_id])  # Full 6D velocity
+
+        print("orig ee: ", xpos_original)
+        print("new ee:  ", dx_new)
+        
+        # Compute numerical Jacobian column-wise
+        J_num[:, i] = (dx_new - xpos_original) / delta
+
+        # Reset velocity
+        data.qpos[:] = qpos_original
+        mujoco.mj_forward(model, data)
+    #print("J_num shape is ------->", J_num.shape)
+    return J_num
+
+
+
+        
+        
+# Load the model from the XML string
+model = mujoco.MjModel.from_xml_path("robot.xml")
+data = mujoco.MjData(model)
+
+c=100
+model.body_mass *=c
+model.body_inertia *= c
+# Assuming `model` is already created using mujoco.MjModel.from_xml_string(xml)
+for i in range(model.nbody):  # Loop over all bodies
+    # Retrieve body name using mj_id2name
+    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i)
+    mass = model.body_mass[i]
+    inertia = model.body_inertia[i]
+    print(f"Body: {body_name}, Mass: {mass}, Inertia: {inertia}")
+
+
+# Remove gravity
+model.opt.gravity = (0, 0, -9.81)
+
+
+dt = 1
+model.opt.timestep = 0.001
+
+# Disable all collisions
+model.geom_contype[:] = 0
+model.geom_conaffinity[:] = 0
+
+k = 10
+data.qpos = ([np.pi/k, np.pi/k, np.pi/k, np.pi/k, np.pi/k, np.pi/k])# ([np.pi/6, np.pi/6, np.pi/6, np.pi/6, np.pi/6, np.pi/6])
+
+
+real_time_factor = 1.0
+next_time_step = time.time()+model.opt.timestep
+sim_start = time.time()
+# Target position & orientation (quaternion)
+x_desired = np.array([0.4, 0, 0.2, 0, 0, 0])
+#target = np.array([0.4, 0, 0.2])# np.array([0.2, 0, 0.2])  # Example target position
+target_euler = np.array([0, 0, 0])  # Example target quaternion (w, x, y, z)
+target_quat = Rotation.from_euler('xyz', target_euler).as_quat()
+
+# Get end-effector ID using the new MuJoCo API
+ee_name = "ee_site"# "dof6"  # Change to your actual end-effector name
+end_effector_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SITE, ee_name)
+print(end_effector_id)
+# raise Exception("p0")
+
+
+# Jacobian storage
+J_pos = np.zeros((3, model.nv), dtype=np.float64)
+J_rot = np.zeros((3, model.nv), dtype=np.float64)
+
+prev_velocity_error = 0
+i = 0
+xpos_desired = np.array([0.2, 0.2, 0.2])#data.site_xpos[end_effector_id]
+xquat_desired = np.zeros(4) 
+mujoco.mju_axisAngle2Quat(xquat_desired, np.array([0, 0, 1]), 0.0)
+
+
+dx_desired = np.zeros(6)
+dx_new= np.zeros(6)
+data.qvel[:] = 0
+data.qacc[:] = 0
+tau_rne = np.zeros(model.nv)
+
+site_quat = np.zeros(4)
+site_quat_conj = np.zeros(4)
+error_quat = np.zeros(4)
+M_inv = np.zeros((model.nv, model.nv))
+Mx = np.zeros((6, 6))
+m_k = 81
+m_d = 2 * np.sqrt(m_k).item()
+i= 0
+with mujoco.viewer.launch_passive(model, data,show_left_ui=False, show_right_ui=False) as viewer:
+    viewer.opt.frame = mujoco.mjtFrame.mjFRAME_SITE
+    while True:
+        while True:
+            xpos_desired = ([0.2, 0.3 *np.sin((i/60000)*2*np.pi), 0.3 *np.cos((i/60000)*2*np.pi)])
+            mujoco.mj_forward(model, data)  # Compute FK
+            
+            # If gravity dynamics is required, set the vel and acc to zero and read the tau_rne
+            # mujoco.mj_rne(model, data, 0, tau_rne)
+
+            # Spatial velocity (aka twist).
+            x_actual = data.site_xpos[end_effector_id]
+            dx_desired[:3] = xpos_desired - x_actual# Kpos * dx / integration_dt
+            mujoco.mju_mat2Quat(site_quat, data.site_xmat[end_effector_id])
+            mujoco.mju_negQuat(site_quat_conj, site_quat)
+            mujoco.mju_mulQuat(error_quat, xquat_desired, site_quat_conj)
+            mujoco.mju_quat2Vel(dx_desired[3:], error_quat, 1.0)
+            
+
+            mujoco.mj_jacSite(model, data, J_pos, J_rot, end_effector_id)
+
+            J = np.vstack([J_pos, J_rot])  # Full spatial Jacobian
+            dx_actual = J @ data.qvel
+            
+
+            # Compute the task-space inertia matrix.
+            mujoco.mj_solveM(model, data, M_inv, np.eye(model.nv))
+            Mx_inv = J @ M_inv @ J.T
+            if abs(np.linalg.det(Mx_inv)) >= 1e-2:
+                Mx = np.linalg.inv(Mx_inv)
+            else:
+                Mx = np.linalg.pinv(Mx_inv, rcond=1e-2)
+
+            if np.linalg.norm(x_actual - xpos_desired) < 0.005:
+                #dx_desired = np.zeros(6)
+                print(x_actual)
+                print(xpos_desired)
+                print("model converged")
+                print("--------------------")
+            print(x_actual)
+            F  = impedance_control(dx_actual, dx_desired, Mx, np.ones(6) * m_k, np.ones(6) * m_d)
+
+            tau = J.T @ F  # Now F has matching dimensions
+
+            gravity_torques = np.copy(data.qfrc_bias)
+
+            data.ctrl[:] =  gravity_torques + tau
+            if (False):
+                # data.ctrl[:] = 0.8 * data.ctrl + 0.2 * tau
+                print("====================================================================")
+                print(dx_old, "---", dx_actual)
+                print("⚠️ Detected bad values:")
+                print("x_actual:", x_actual)
+                print("x_desired:", x_desired)
+                print("dx_actual:", dx_actual)
+                print("F:", F)
+                print("tau:", tau)
+                print("qpos:", data.qpos)
+                print("qvel:", data.qvel)
+                print(data.qfrc_inverse)
+                      
+            mujoco.mj_inverse(model, data)
+            mujoco.mj_step(model, data)
+            viewer.sync()
+            i+=1
+            time_to_sleep = max(next_time_step - time.time(), 0)
+            # time_to_sleep = (next_time_step - time.time()) if (next_time_step - time.time() > 0) else 0
+            time.sleep(time_to_sleep)
+            next_time_step += model.opt.timestep
+
+
+
+
+
+xml4 = """
+<mujoco>
+    <worldbody>
+    <light name="top" pos="0 0 1"/>
+    <body name="link0" pos="0 0 0" euler="0 0 0">
+       <body name="dof1" pos="0 0 0" >
+            <joint name="joint0" type="hinge" axis="0 0 1" damping="0.0" frictionloss="0.0"/>
+            <geom type="capsule" fromto="0 0 0 0 0 0.2" size="0.01"/>
+            <geom type="cylinder" fromto="0 0 -0.01 0 0 0.01" size="0.02"/>
+            <!-- X-Axis (Red) -->
+            <geom type="cylinder" fromto="0 0 0 0.05 0 0" size="0.001" rgba="1 0 0 1"/>
+            <!-- Y-Axis (Green) -->
+            <geom type="cylinder" fromto="0 0 0 0 0.05 0" size="0.001" rgba="0 1 0 1"/>
+            <!-- Z-Axis (Blue) -->
+            <geom type="cylinder" fromto="0 0 0 0 0 0.05" size="0.001" rgba="0 0 1 1"/>
+            <!--link 2-->
+            <body name="dof2" pos="0 0 0.2" euler="0 90 0">
+                <body name="coor_sys1" pos="0 0 0" euler="90 0 90">
+                    <geom type="cylinder" pos="0 0 0" fromto="0 0 -0.01 0 0 0.01" size="0.02" euler="0 0 0" />
+                    <joint name="joint1" type="hinge" axis="0 0 1" />
+                    <!-- X-Axis (Red) -->
+                    <geom type="cylinder" fromto="0 0 0 0.05 0 0" size="0.001" rgba="1 0 0 1"/>
+                    <!-- Y-Axis (Green) -->
+                    <geom type="cylinder" fromto="0 0 0 0 0.05 0" size="0.001" rgba="0 1 0 1"/>
+                    <!-- Z-Axis (Blue) -->
+                    <geom type="cylinder" fromto="0 0 0 0 0 0.05" size="0.001" rgba="0 0 1 1"/>
+                    <geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.01"/>
+                    <!--link 3-->
+                    <body name="dof3" pos="0.2 0 0" euler="0 0 0">
+                        <geom type="capsule" fromto="0 0 0 0.2 0 0" size="0.01"/>
+                        <geom type="cylinder" pos="0 0 0" fromto="0 0 -0.01 0 0 0.01" size="0.02" euler="0 90 90" />
+                        <joint name="joint2" type="hinge" axis="0 0 1" />                    
+                        <!-- X-Axis (Red) -->
+                        <geom type="cylinder" fromto="0 0 0 0.05 0 0" size="0.001" rgba="1 0 0 1"/>
+                        <!-- Y-Axis (Green) -->
+                        <geom type="cylinder" fromto="0 0 0 0 0.05 0" size="0.001" rgba="0 1 0 1"/>
+                        <!-- Z-Axis (Blue) -->
+                        <geom type="cylinder" fromto="0 0 0 0 0 0.05" size="0.001" rgba="0 0 1 1"/>
+                        <!--link 4-->
+                        <body name="dof4" pos="0.2 0 0" euler="90 90 0">
+                            <geom type="capsule" fromto="0 0 0 0 0 0.02" size="0.01"/>
+                            <geom type="cylinder" pos="0 0 0" fromto="0 0 -0.01 0 0 0.01" size="0.02" euler="0 90 90" />
+                            <joint name="joint3" type="hinge" axis="0 0 1" />                    
+                            <!-- X-Axis (Red) -->
+                            <geom type="cylinder" fromto="0 0 0 0.05 0 0" size="0.001" rgba="1 0 0 1"/>
+                            <!-- Y-Axis (Green) -->
+                            <geom type="cylinder" fromto="0 0 0 0 0.05 0" size="0.001" rgba="0 1 0 1"/>
+                            <!-- Z-Axis (Blue) -->
+                            <geom type="cylinder" fromto="0 0 0 0 0 0.05" size="0.001" rgba="0 0 1 1"/>
+                            <!--link 5-->
+                            <body name="dof5" pos="0 0 0.02" euler="90 0 0">
+                                <geom type="capsule" fromto="0 0 0 0 0.02 0" size="0.01"/>
+                                <geom type="cylinder" pos="0 0 0" fromto="0 0 -0.01 0 0 0.01" size="0.02" euler="0 90 90" />
+                                <joint name="joint4" type="hinge" axis="0 0 1" />                    
+                                <!-- X-Axis (Red) -->
+                                <geom type="cylinder" fromto="0 0 0 0.05 0 0" size="0.001" rgba="1 0 0 1"/>
+                                <!-- Y-Axis (Green) -->
+                                <geom type="cylinder" fromto="0 0 0 0 0.05 0" size="0.001" rgba="0 1 0 1"/>
+                                <!-- Z-Axis (Blue) -->
+                                <geom type="cylinder" fromto="0 0 0 0 0 0.05" size="0.001" rgba="0 0 1 1"/>
+                                <!--link 6-->
+                                <body name="dof6" pos="0 0.02 0" euler="-90 0 0">
+                                    <geom type="capsule" fromto="0 0 0 0 0 0.02" size="0.01"/>
+                                    <geom type="cylinder" pos="0 0 0" fromto="0 0 -0.01 0 0 0.01" size="0.02" euler="0 90 90" />
+                                    <joint name="joint5" type="hinge" axis="0 0 1" />                    
+                                    <!-- X-Axis (Red) -->
+                                    <geom type="cylinder" fromto="0 0 0 0.05 0 0" size="0.001" rgba="1 0 0 1"/>
+                                    <!-- Y-Axis (Green) -->
+                                    <geom type="cylinder" fromto="0 0 0 0 0.05 0" size="0.001" rgba="0 1 0 1"/>
+                                    <!-- Z-Axis (Blue) -->
+                                    <geom type="cylinder" fromto="0 0 0 0 0 0.05" size="0.001" rgba="0 0 1 1"/>
+                                    <body name="ee" pos="0 0 0.02" >
+                                        <geom type="sphere" size="0.005" pos="0 0 0.02"/>
+                                        <site name="ee_site" pos="0 0 0" size="0.005 0.005 0.005" type="sphere" rgba="1 0 0 1"/>
+                                    </body>
+                                </body>
+                            </body>
+                        </body>
+                    </body>
+                </body>
+            </body>
+        </body>
+    </body>
+    </worldbody>
+    <actuator>
+        <motor name="motor0" joint="joint0" ctrlrange="-1.0 1.0"/>
+        <motor name="motor1" joint="joint1" ctrlrange="-1.0 1.0"/>
+        <motor name="motor2" joint="joint2" ctrlrange="-1.0 1.0"/>
+        <motor name="motor3" joint="joint3" ctrlrange="-1.0 1.0"/>
+        <motor name="motor4" joint="joint4" ctrlrange="-1.0 1.0"/>
+        <motor name="motor5" joint="joint5" ctrlrange="-1.0 1.0"/>
+    </actuator>
+</mujoco>
+
+"""
+
