@@ -15,7 +15,7 @@ The project explores impedance-based control of a wearable supernumerary robotic
 **Included workflows**
 
 - Load and simulate the SRL model in MuJoCo.
-- Execute the controller in `main2.py`.
+- Execute the controller in `srl_impedance_simulation.py`.
 - Visualize the model in MuJoCo's passive viewer.
 - Record six per-joint generalized-force channels against simulation time.
 
@@ -34,23 +34,19 @@ python -m pip install mujoco numpy scipy matplotlib dynamixel-sdk \
   opencv-python-headless imageio-ffmpeg
 ```
 
-Additional packages may be required by your particular `main2.py` and `hw_interface.py`. Install them according to the imports in those files.
+Additional packages may be required by your particular `srl_impedance_simulation.py` and `hw_interface.py`. Install them according to the imports in those files.
 
 ## Running the simulation
 
-On **macOS**, launch the MuJoCo passive viewer using `mjpython` rather than `python`:
+On **Windows**, run the MuJoCo simulation using Python from PowerShell:
 
-```bash
-MPLBACKEND=Agg mjpython main2.py
+```powershell
+$env:MPLBACKEND = "Agg"
+python srl_impedance_simulation.py
 ```
 
-`MPLBACKEND=Agg` prevents Matplotlib GUI windows from being opened on non-main threads. It does **not** display interactive torque plots; use the demo/plot workflow below instead.
-
-On other platforms, MuJoCo's regular Python launcher may be sufficient:
-
-```bash
-MPLBACKEND=Agg python main2.py
-```
+`MPLBACKEND=Agg` prevents Matplotlib from opening interactive plot windows. It does **not** display interactive torque plots; use the demo/plot workflow instead.
 
 **Hardware caution:** The controller imports `hw_interface.py`, which uses the Dynamixel SDK. Check whether your version performs hardware initialization or sends commands before running with physical motors connected. The instructions above do not guarantee simulation-only execution.
+
 
